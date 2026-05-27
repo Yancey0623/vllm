@@ -425,11 +425,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        self.dcp_world_size = dcp_world_size
+        group_block_sizes = [
+            manager.block_size for manager in self.single_type_managers
+        ]
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
-            for g in kv_cache_config.kv_cache_groups
-        ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
+            block_size % hash_block_size == 0 for block_size in group_block_sizes
+        ), (
+            "Each KV cache group's real block_size must be divisible by "
+            f"hash_block_size. block_sizes={group_block_sizes}, "
+            f"hash_block_size={hash_block_size}"
+        )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
@@ -473,7 +479,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # to make sure the cache hit length is a multiple of the block size of
         # each attention type. Requiring this because we don't support partial
         # block cache hit yet.
-        block_sizes = [spec.block_size for spec, _, _ in attention_groups]
+        block_sizes = [
+            self.single_type_managers[group_ids[0]].block_size
+            for _, group_ids, _ in attention_groups
+        ]
         self.lcm_block_size = lcm(*block_sizes)
 
         # Attention-group indices (into ``self.attention_groups``) that
@@ -523,11 +532,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - The number of tokens of the longest cache hit.
         """
 
-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
+        def _get_block_hashes(block_size: int) -> BlockHashList:
+            if block_size == self.hash_block_size:
                 return block_hashes
             return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                block_hashes, self.hash_block_size, block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -549,13 +558,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             curr_hit_length = hit_length
 
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                group_block_size = self.single_type_managers[group_ids[0]].block_size
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
                     # Full attention is downward-closed: we only need to look
                     # up cached blocks once; on subsequent iterations just trim
                     # to the (reduced) current hit length.
                     curr_hit_length = (
-                        curr_hit_length // spec.block_size * spec.block_size
+                        curr_hit_length // group_block_size * group_block_size
                     )
                     continue
 
@@ -567,18 +577,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if use_eagle:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
-                        curr_hit_length + spec.block_size, max_cache_hit_length
+                        curr_hit_length + group_block_size, max_cache_hit_length
                     )
                 hit_blocks = manager_cls.find_longest_cache_hit(
-                    block_hashes=_get_block_hashes(spec),
+                    block_hashes=_get_block_hashes(group_block_size),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
                     use_eagle=use_eagle,
                     alignment_tokens=self.lcm_block_size,
+                    dcp_world_size=(
+                        self.dcp_world_size
+                        if isinstance(spec, FullAttentionSpec)
+                        else 1
+                    ),
                 )
-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                _new_hit_length = len(hit_blocks[0]) * group_block_size
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -597,7 +612,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Truncate full attention blocks to final hit_length (if present)
         spec, group_ids, _ = self.attention_groups[0]
         if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // spec.block_size
+            group_block_size = self.single_type_managers[group_ids[0]].block_size
+            num_blocks = hit_length // group_block_size
             for group_id in group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
