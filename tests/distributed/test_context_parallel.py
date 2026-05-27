@@ -32,6 +32,7 @@ CP_TEST_MODELS = [
     # [LANGUAGE GENERATION]
     "deepseek-ai/DeepSeek-V2-Lite-Chat",
     "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen/Qwen3.5-0.8B",  # hybrid attention model
 ]
 
 # GSM8K eval configuration
@@ -43,6 +44,9 @@ MIN_ACCURACY = {
     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.64,
     # .buildkite/lm-eval-harness/configs/Qwen2.5-1.5B-Instruct.yaml
     "Qwen/Qwen2.5-1.5B-Instruct": 0.52,
+    # Qwen3.5-0.8B TP+DCP baseline is around 0.27 on this GSM8K smoke
+    # test; keep a small buffer for 256-question variance.
+    "Qwen/Qwen3.5-0.8B": 0.26,
 }
 
 
@@ -138,6 +142,13 @@ CP_TEXT_GENERATION_MODELS = {
             cp_kv_cache_interleave_size=16, attn_backend="FLASHINFER"
         ),
     ],
+    "Qwen/Qwen3.5-0.8B": [
+        CPTestSettings.detailed(dcp_multipliers=[0.25]),
+        CPTestSettings.detailed(
+            cp_kv_cache_interleave_size=16,
+            attn_backend="FLASH_ATTN",
+        ),
+    ],
 }
 
 
@@ -219,13 +230,20 @@ def _test_cp_gsm8k(
         ]
     )
 
+    server_env = {}
     if attn_backend:
         server_args.append(f"--attention-backend={attn_backend}")
+        server_env["VLLM_ATTENTION_BACKEND"] = attn_backend
+    if model_id == "Qwen/Qwen3.5-0.8B":
+        # FA4 currently achieves lower accuracy for DCP, so use FA2 for this
+        # hybrid-attention DCP correctness test.
+        server_env["VLLM_USE_BLADNN_FA4"] = "0"
 
     with RemoteOpenAIServer(
         model_id,
         server_args,
         max_wait_seconds=720,
+        env_dict=server_env,
     ) as remote_server:
         host = f"http://{remote_server.host}"
         port = remote_server.port
